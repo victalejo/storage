@@ -208,6 +208,112 @@ describe.skipIf(getConfig().databaseEngine === 'multigres')('tenant notification
     expect(await timestamp('timestamp-test')).toBe(afterJson)
   })
 
+  it('routes migration-only updates separately after the listener rollout', async () => {
+    await writer.query('ALTER TABLE tenants ADD COLUMN IF NOT EXISTS future_config json')
+    await writer.query(`
+      INSERT INTO public.tenants (id, anon_key, database_url, jwt_secret, service_key)
+      VALUES ('split-test', 'anon', 'url', 'secret', 'service')
+    `)
+    await listener.query('LISTEN tenants_migrations_update')
+    const migration = await readFile(
+      'migrations/rollout/tenant-migration-notifications.sql',
+      'utf8'
+    )
+    await writer.query(migration)
+    await writer.query(migration)
+
+    expect(
+      await splitNotificationsFor(
+        "UPDATE tenants SET migrations_status = 'FAILED' WHERE id = 'split-test'"
+      )
+    ).toEqual(['tenants_migrations_update'])
+    expect(
+      await splitNotificationsFor(
+        "UPDATE tenants SET migrations_status = 'FAILED' WHERE id = 'split-test'"
+      )
+    ).toEqual([])
+    expect(
+      await splitNotificationsFor("UPDATE tenants SET anon_key = 'new' WHERE id = 'split-test'")
+    ).toEqual(['tenants_update'])
+    expect(
+      await splitNotificationsFor(
+        "UPDATE tenants SET anon_key = 'other', migrations_version = 'storage-schema' WHERE id = 'split-test'"
+      )
+    ).toEqual(['tenants_update'])
+    expect(
+      await splitNotificationsFor(
+        "UPDATE tenants SET future_config = '{\"x\":1}'::json WHERE id = 'split-test'"
+      )
+    ).toEqual(['tenants_update'])
+    expect(
+      await splitNotificationsFor(
+        "BEGIN; UPDATE tenants SET migrations_status = NULL WHERE id = 'split-test'; ROLLBACK"
+      )
+    ).toEqual([])
+    // Row-type changes after the function has run in this session keep routing correct.
+    await writer.query('ALTER TABLE tenants ADD COLUMN later_config json')
+    expect(
+      await splitNotificationsFor(
+        "UPDATE tenants SET later_config = '{\"x\":1}'::json WHERE id = 'split-test'"
+      )
+    ).toEqual(['tenants_update'])
+    expect(
+      await splitNotificationsFor(
+        "UPDATE tenants SET migrations_status = 'COMPLETED' WHERE id = 'split-test'"
+      )
+    ).toEqual(['tenants_migrations_update'])
+    await writer.query('ALTER TABLE tenants DROP COLUMN later_config')
+    expect(
+      await splitNotificationsFor(
+        "UPDATE tenants SET anon_key = 'after-drop' WHERE id = 'split-test'"
+      )
+    ).toEqual(['tenants_update'])
+    expect(
+      await splitNotificationsFor(
+        "UPDATE tenants SET migrations_version = 'initialmigration' WHERE id = 'split-test'"
+      )
+    ).toEqual(['tenants_migrations_update'])
+    expect(await splitNotificationsFor("DELETE FROM tenants WHERE id = 'split-test'")).toEqual([
+      'tenants_update',
+    ])
+
+    // Restoring the legacy trigger makes an old listener safe before rollback.
+    await writer.query(`
+      INSERT INTO public.tenants (id, anon_key, database_url, jwt_secret, service_key)
+      VALUES ('split-test', 'anon', 'url', 'secret', 'service')
+    `)
+    await writer.query(
+      await readFile('migrations/multitenant/0032-notify-changed-tenants.sql', 'utf8')
+    )
+    expect(
+      await splitNotificationsFor(
+        "UPDATE tenants SET migrations_status = 'FAILED' WHERE id = 'split-test'"
+      )
+    ).toEqual(['tenants_update'])
+  })
+
+  async function splitNotificationsFor(sql: string): Promise<string[]> {
+    const marker = JSON.stringify(`marker-${randomUUID()}`)
+    const messages: string[] = []
+    let resolveMarker!: () => void
+    const markerSeen = new Promise<void>((resolve) => {
+      resolveMarker = resolve
+    })
+    const onNotification = (message: { channel: string; payload?: string }) => {
+      if (message.payload === marker) resolveMarker()
+      else if (message.payload === '"split-test"') messages.push(message.channel)
+    }
+    listener.on('notification', onNotification)
+    try {
+      await writer.query(sql)
+      await writer.query("SELECT pg_notify('tenants_update', $1)", [marker])
+      await markerSeen
+      return messages
+    } finally {
+      listener.off('notification', onNotification)
+    }
+  }
+
   async function notificationsFor(sql: string): Promise<string[]> {
     const marker = JSON.stringify(`marker-${randomUUID()}`)
     const messages: string[] = []

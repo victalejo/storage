@@ -30,7 +30,7 @@ import { createInvalidatableSingleFlightByKey } from '../concurrency'
 import { isStringMessage, PubSubAdapter } from '../pubsub'
 import { DBMigration } from './migrations/types'
 import { multitenantPgExecutor } from './multitenant-pg'
-import { TenantConfigStorePg } from './tenant-store-pg'
+import { type TenantConfigRow, TenantConfigStorePg } from './tenant-store-pg'
 
 interface TenantConfig {
   anonKey?: string
@@ -46,14 +46,17 @@ interface TenantConfig {
     role: string
   }
   deleteObjectsLimit?: number
+  tracingMode?: string
+  disableEvents?: string[]
+  subscriptionTier?: string
+}
+
+interface TenantMigrationState {
   migrationVersion?: keyof typeof DBMigration
   /** The recorded version is unknown to this binary, so a newer release already migrated past it. */
   migrationVersionAhead?: boolean
   migrationStatus?: TenantMigrationStatus
   syncMigrationsDone?: boolean
-  tracingMode?: string
-  disableEvents?: string[]
-  subscriptionTier?: string
 }
 
 type GetTenantConfigOptions = {
@@ -106,6 +109,9 @@ const tenantConfigCache = createLruCache<string, TenantConfig>(TENANT_CONFIG_CAC
 })
 
 const tenantConfigSingleFlight = createInvalidatableSingleFlightByKey<TenantConfig>()
+const tenantMigrationStateSingleFlight =
+  createInvalidatableSingleFlightByKey<TenantMigrationState>()
+const tenantMigrationStates = new WeakMap<TenantConfig, TenantMigrationState>()
 const EMPTY_JWKS_CONFIG = freezeJwksConfig({ keys: [] })
 
 export const jwksManager = new JWKSManager(new JWKSManagerStorePg(multitenantPgExecutor))
@@ -179,7 +185,59 @@ function mergeTenantJwksWithLegacyKeys(
  */
 export function deleteTenantConfig(tenantId: string): void {
   tenantConfigSingleFlight.invalidate(tenantId)
+  tenantMigrationStateSingleFlight.invalidate(tenantId)
   tenantConfigCache.delete(tenantId)
+}
+
+export function deleteTenantMigrationState(tenantId: string): void {
+  tenantConfigSingleFlight.invalidate(tenantId)
+  tenantMigrationStateSingleFlight.invalidate(tenantId)
+  const config = tenantConfigCache.peek(tenantId)
+  if (config) tenantMigrationStates.delete(config)
+}
+
+function toTenantMigrationState(
+  tenantId: string,
+  tenant: Pick<TenantConfigRow, 'migrations_version' | 'migrations_status'>
+): TenantMigrationState {
+  const { migrations_version, migrations_status } = tenant
+  const migrationVersionAhead = isUnrecognizedMigration(migrations_version)
+  if (migrationVersionAhead) {
+    logSchema.warning(logger, '[Migrations] Tenant migration unrecognized by this binary', {
+      type: 'migrations',
+      project: tenantId,
+      metadata: JSON.stringify({
+        recordedMigration: migrations_version,
+        highestKnownMigration: highestKnownMigrationName(),
+      }),
+    })
+  }
+  return {
+    migrationVersion: migrationVersionAhead
+      ? highestKnownMigrationName()
+      : (migrations_version as keyof typeof DBMigration | undefined),
+    migrationVersionAhead,
+    migrationStatus: migrations_status as TenantMigrationStatus | undefined,
+  }
+}
+
+export async function getTenantMigrationState(
+  tenantId: string,
+  options?: GetTenantConfigOptions
+): Promise<TenantMigrationState> {
+  const config = await getTenantConfig(tenantId, options)
+  const state = tenantMigrationStates.get(config)
+  if (state) return state
+
+  return tenantMigrationStateSingleFlight(tenantId, {
+    load: async () => {
+      const tenant = await tenantConfigStorePg.findMigrationsInfo(tenantId)
+      if (!tenant) throw ERRORS.MissingTenantConfig(tenantId)
+      return toTenantMigrationState(tenantId, tenant)
+    },
+    retry: () => getTenantMigrationState(tenantId, CACHE_LOOKUP_WITHOUT_METRICS),
+    commit: (state) => tenantMigrationStates.set(config, state),
+  })
 }
 
 /**
@@ -229,8 +287,6 @@ export async function getTenantConfig(
         database_pool_url,
         max_connections,
         delete_objects_limit,
-        migrations_version,
-        migrations_status,
         tracing_mode,
         disable_events,
         subscription_tier,
@@ -238,18 +294,6 @@ export async function getTenantConfig(
 
       const serviceKey = decrypt(service_key)
       const jwtSecret = decrypt(jwt_secret)
-
-      const migrationVersionAhead = isUnrecognizedMigration(migrations_version)
-      if (migrationVersionAhead) {
-        logSchema.warning(logger, '[Migrations] Tenant migration unrecognized by this binary', {
-          type: 'migrations',
-          project: tenantId,
-          metadata: JSON.stringify({
-            recordedMigration: migrations_version,
-            highestKnownMigration: highestKnownMigrationName(),
-          }),
-        })
-      }
 
       const config = {
         anonKey: decrypt(anon_key),
@@ -293,17 +337,11 @@ export async function getTenantConfig(
             enabled: Boolean(feature_object_versioning),
           },
         },
-        // Present an ahead version as the newest one this binary understands.
-        migrationVersion: migrationVersionAhead
-          ? highestKnownMigrationName()
-          : (migrations_version as keyof typeof DBMigration | undefined),
-        migrationVersionAhead,
-        migrationStatus: migrations_status as TenantMigrationStatus | undefined,
-        migrationsRun: false,
         tracingMode: tracing_mode ?? undefined,
         disableEvents: disable_events ?? undefined,
         subscriptionTier: subscription_tier ?? undefined,
       }
+      tenantMigrationStates.set(config, toTenantMigrationState(tenantId, tenant))
       return config
     },
     retry: () => getTenantConfig(tenantId, CACHE_LOOKUP_WITHOUT_METRICS),
@@ -358,7 +396,11 @@ export async function getTenantCapabilities(tenantId: string) {
   let objectVersioningEnabled = storageVersioningEnabled
 
   if (isMultitenant) {
-    const { migrationVersion, features } = await getTenantConfig(tenantId)
+    const { features } = await getTenantConfig(tenantId)
+    const { migrationVersion } = await getTenantMigrationState(
+      tenantId,
+      CACHE_LOOKUP_WITHOUT_METRICS
+    )
     latestMigrationName = migrationVersion || 'initialmigration'
     objectVersioningEnabled = storageVersioningEnabled || features.objectVersioning.enabled
   }
@@ -476,6 +518,7 @@ export async function getFeatures(tenantId: string): Promise<Features> {
 }
 
 const TENANTS_UPDATE_CHANNEL = 'tenants_update'
+const TENANTS_MIGRATIONS_UPDATE_CHANNEL = 'tenants_migrations_update'
 
 /**
  * Keeps the in memory config cache up to date
@@ -487,6 +530,11 @@ export async function listenForTenantUpdate(pubSub: PubSubAdapter): Promise<void
     }
 
     void onTenantConfigChange(cacheKey)
+  })
+  await pubSub.subscribe(TENANTS_MIGRATIONS_UPDATE_CHANNEL, (cacheKey) => {
+    if (isStringMessage(cacheKey)) {
+      deleteTenantMigrationState(cacheKey)
+    }
   })
   await s3CredentialsManager.listenForTenantUpdate(pubSub)
   await jwksManager.listenForTenantUpdate(pubSub)

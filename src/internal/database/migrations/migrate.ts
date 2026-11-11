@@ -12,7 +12,11 @@ import type { DatabaseExecutor, DatabaseTransaction } from '../connection'
 import { multitenantPgExecutor } from '../multitenant-pg'
 import { searchPath } from '../pool'
 import { getSslSettings } from '../postgres/ssl'
-import { deleteTenantConfig, getTenantConfig, TenantMigrationStatus } from '../tenant'
+import {
+  deleteTenantMigrationState,
+  getTenantMigrationState,
+  TenantMigrationStatus,
+} from '../tenant'
 import { TenantConfigStorePg } from '../tenant-store-pg'
 import { deriveVectorDatabaseUrl, VECTOR_DATABASE_NAME } from '../vector-store-url'
 import { repairInvalidConcurrentIndexes } from './concurrent-index-guard'
@@ -93,7 +97,7 @@ export function startAsyncMigrations(signal: AbortSignal) {
 
 export async function tenantHasMigrations(tenantId: string, migration: keyof typeof DBMigration) {
   const migrationVersion = isMultitenant
-    ? (await getTenantConfig(tenantId)).migrationVersion
+    ? (await getTenantMigrationState(tenantId)).migrationVersion
     : await lastLocalMigrationName()
 
   if (migrationVersion) {
@@ -186,8 +190,8 @@ export async function updateTenantMigrationsState(
   )
 
   if (updated === 0) {
-    // A newer release recorded this tenant; drop the stale local config so the next read sees it as ahead.
-    deleteTenantConfig(tenantId)
+    // A newer release recorded this tenant; reload its migration state on the next read.
+    deleteTenantMigrationState(tenantId)
     logSchema.info(
       logger,
       '[Migrations] Skipped state update for a tenant recorded by a newer release',
@@ -208,7 +212,7 @@ export async function updateTenantMigrationsState(
  */
 export async function areMigrationsUpToDate(tenantId: string) {
   const latestMigrationVersion = await lastLocalMigrationName()
-  const tenant = await getTenantConfig(tenantId)
+  const tenant = await getTenantMigrationState(tenantId)
 
   // A newer release already migrated this tenant past anything this binary can run.
   if (tenant.migrationVersionAhead) {

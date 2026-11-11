@@ -4,7 +4,7 @@ import { ErrorCode, isStorageError } from '@internal/errors'
 import { RunMigrationsOnTenants } from '@storage/events'
 import { getConfig } from '../../../config'
 import { logger, logSchema } from '../../monitoring'
-import { getTenantConfig, TenantMigrationStatus } from '../tenant'
+import { getTenantMigrationState, TenantMigrationStatus } from '../tenant'
 
 const { dbMigrationFreezeAt } = getConfig()
 const maxBatchSendBackoffMs = 60_000
@@ -114,17 +114,17 @@ export class ProgressiveMigrations {
 
     const jobs = await Promise.allSettled(
       tenantsBatch.map(async (tenant) => {
-        const tenantConfig = await getTenantConfig(tenant)
+        const migrationState = await getTenantMigrationState(tenant)
         const migrationsUpToDate = await areMigrationsUpToDate(tenant)
 
-        if (migrationsUpToDate || tenantConfig.syncMigrationsDone) {
+        if (migrationsUpToDate || migrationState.syncMigrationsDone) {
           return
         }
 
         const scheduleAt = new Date()
         scheduleAt.setMinutes(scheduleAt.getMinutes() + 5)
         const scheduleForLater =
-          tenantConfig.migrationStatus === TenantMigrationStatus.FAILED_STALE
+          migrationState.migrationStatus === TenantMigrationStatus.FAILED_STALE
             ? scheduleAt
             : undefined
 

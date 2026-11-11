@@ -106,8 +106,8 @@ vi.mock('../multitenant-pg', () => ({
 }))
 
 vi.mock('../tenant', () => ({
-  deleteTenantConfig: vi.fn(),
-  getTenantConfig: vi.fn(),
+  deleteTenantMigrationState: vi.fn(),
+  getTenantMigrationState: vi.fn(),
   TenantMigrationStatus: {
     COMPLETED: 'COMPLETED',
     FAILED: 'FAILED',
@@ -133,7 +133,11 @@ vi.mock('./progressive', () => ({
   },
 }))
 
-import { deleteTenantConfig, getTenantConfig, TenantMigrationStatus } from '../tenant'
+import {
+  deleteTenantMigrationState,
+  getTenantMigrationState,
+  TenantMigrationStatus,
+} from '../tenant'
 import {
   areMigrationsUpToDate,
   migrate,
@@ -890,21 +894,21 @@ describe('migration state for a tenant recorded by a newer release', () => {
   })
 
   it('treats an ahead tenant as up to date regardless of its status', async () => {
-    vi.mocked(getTenantConfig).mockResolvedValue({
+    vi.mocked(getTenantMigrationState).mockResolvedValue({
       migrationVersion: 'storage-schema',
       migrationVersionAhead: true,
       migrationStatus: TenantMigrationStatus.FAILED,
-    } as Awaited<ReturnType<typeof getTenantConfig>>)
+    } as Awaited<ReturnType<typeof getTenantMigrationState>>)
 
     await expect(areMigrationsUpToDate('tenant-ahead')).resolves.toBe(true)
   })
 
   it('still reports a known tenant behind the local latest as outdated', async () => {
-    vi.mocked(getTenantConfig).mockResolvedValue({
+    vi.mocked(getTenantMigrationState).mockResolvedValue({
       migrationVersion: 'initialmigration',
       migrationVersionAhead: false,
       migrationStatus: TenantMigrationStatus.COMPLETED,
-    } as Awaited<ReturnType<typeof getTenantConfig>>)
+    } as Awaited<ReturnType<typeof getTenantMigrationState>>)
 
     await expect(areMigrationsUpToDate('tenant-behind')).resolves.toBe(false)
   })
@@ -924,7 +928,7 @@ describe('migration state for a tenant recorded by a newer release', () => {
       }),
       expect.anything()
     )
-    expect(deleteTenantConfig).toHaveBeenCalledWith('tenant-ahead')
+    expect(deleteTenantMigrationState).toHaveBeenCalledWith('tenant-ahead')
     expect(mockInfo).toHaveBeenCalledWith(
       expect.anything(),
       '[Migrations] Skipped state update for a tenant recorded by a newer release',
@@ -940,6 +944,6 @@ describe('migration state for a tenant recorded by a newer release', () => {
       state: TenantMigrationStatus.COMPLETED,
     })
 
-    expect(deleteTenantConfig).not.toHaveBeenCalled()
+    expect(deleteTenantMigrationState).not.toHaveBeenCalled()
   })
 })

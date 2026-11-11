@@ -1,6 +1,6 @@
 import { vi } from 'vitest'
 
-type MockTenantConfig = {
+type MockTenantMigrationState = {
   migrationStatus: string | undefined
   syncMigrationsDone: boolean
 }
@@ -11,17 +11,22 @@ type MockMigrationJob = {
 
 type MockBatchSend = (jobs: MockMigrationJob[]) => Promise<void> | void
 
-const { mockBatchSend, mockGetTenantConfig, mockAreMigrationsUpToDate, mockWarning, mockError } =
-  vi.hoisted(() => ({
-    mockBatchSend: vi.fn<MockBatchSend>(),
-    mockGetTenantConfig: vi.fn<(tenantId: string) => Promise<MockTenantConfig>>(),
-    mockAreMigrationsUpToDate: vi.fn<(tenantId: string) => Promise<boolean>>(),
-    mockWarning: vi.fn(),
-    mockError: vi.fn(),
-  }))
+const {
+  mockBatchSend,
+  mockGetTenantMigrationState,
+  mockAreMigrationsUpToDate,
+  mockWarning,
+  mockError,
+} = vi.hoisted(() => ({
+  mockBatchSend: vi.fn<MockBatchSend>(),
+  mockGetTenantMigrationState: vi.fn<(tenantId: string) => Promise<MockTenantMigrationState>>(),
+  mockAreMigrationsUpToDate: vi.fn<(tenantId: string) => Promise<boolean>>(),
+  mockWarning: vi.fn(),
+  mockError: vi.fn(),
+}))
 
 vi.mock('../tenant', () => ({
-  getTenantConfig: mockGetTenantConfig,
+  getTenantMigrationState: mockGetTenantMigrationState,
   TenantMigrationStatus: {
     FAILED_STALE: 'FAILED_STALE',
   },
@@ -155,7 +160,7 @@ class ThrowOnceProgressiveMigrations extends TestProgressiveMigrations {
 
 const mockRunMigrationsBatchSend = mockBatchSend
 const defaultOptions = { maxSize: 10, interval: 1000 }
-const defaultTenantConfig: MockTenantConfig = {
+const defaultTenantMigrationState: MockTenantMigrationState = {
   migrationStatus: undefined,
   syncMigrationsDone: false,
 }
@@ -189,7 +194,7 @@ describe('ProgressiveMigrations', () => {
   beforeEach(() => {
     vi.resetAllMocks()
 
-    mockGetTenantConfig.mockResolvedValue(defaultTenantConfig)
+    mockGetTenantMigrationState.mockResolvedValue(defaultTenantMigrationState)
     mockAreMigrationsUpToDate.mockResolvedValue(false)
     mockRunMigrationsBatchSend.mockResolvedValue(undefined)
   })
@@ -290,7 +295,7 @@ describe('ProgressiveMigrations', () => {
       await migrations.advanceBothClocksBy(500)
       migrations.addTenant('tenant-b')
 
-      expect(mockGetTenantConfig).toHaveBeenCalledTimes(1)
+      expect(mockGetTenantMigrationState).toHaveBeenCalledTimes(1)
       expect(migrations.pending()).toEqual(['tenant-a', 'tenant-b'])
       expect(migrations.backoffState()).toEqual({
         consecutiveFailures: 1,
@@ -477,19 +482,19 @@ describe('ProgressiveMigrations', () => {
 
   it('schedules remaining work after a batch that was already in flight', async () => {
     vi.useFakeTimers()
-    const tenantConfig = Promise.withResolvers<MockTenantConfig>()
-    mockGetTenantConfig.mockReturnValueOnce(tenantConfig.promise)
+    const migrationState = Promise.withResolvers<MockTenantMigrationState>()
+    mockGetTenantMigrationState.mockReturnValueOnce(migrationState.promise)
 
     const { migrations, controller } = startMigrations({ maxSize: 1 })
 
     try {
       migrations.addTenant('tenant-a')
-      expect(mockGetTenantConfig).toHaveBeenCalledWith('tenant-a')
+      expect(mockGetTenantMigrationState).toHaveBeenCalledWith('tenant-a')
 
       migrations.addTenant('tenant-b')
       expect(vi.getTimerCount()).toBe(0)
 
-      tenantConfig.resolve(defaultTenantConfig)
+      migrationState.resolve(defaultTenantMigrationState)
       await migrations.waitForCurrentRun()
 
       expect(mockRunMigrationsBatchSend).toHaveBeenCalledTimes(1)
@@ -510,7 +515,7 @@ describe('ProgressiveMigrations', () => {
 
   it('keeps queue wakeups alive until a rotated preparation failure is retried', async () => {
     vi.useFakeTimers()
-    mockGetTenantConfig.mockRejectedValueOnce(new Error('control database unavailable'))
+    mockGetTenantMigrationState.mockRejectedValueOnce(new Error('control database unavailable'))
     mockAreMigrationsUpToDate.mockImplementation(async (tenantId) => {
       return tenantId === 'tenant-current'
     })
@@ -788,12 +793,12 @@ describe('ProgressiveMigrations', () => {
 
     await expect(migrations.flush(1)).resolves.toBeUndefined()
     migrations.advanceTime(1000)
-    mockGetTenantConfig.mockRejectedValue(new Error('control database unavailable'))
+    mockGetTenantMigrationState.mockRejectedValue(new Error('control database unavailable'))
 
     await expect(migrations.flush(1)).resolves.toBeUndefined()
 
     expect(mockRunMigrationsBatchSend).toHaveBeenCalledTimes(1)
-    expect(mockGetTenantConfig).toHaveBeenCalledTimes(2)
+    expect(mockGetTenantMigrationState).toHaveBeenCalledTimes(2)
     expect(migrations.pending()).toEqual(['tenant-a'])
     expect(migrations.backoffState()).toEqual({
       consecutiveFailures: 1,
@@ -870,7 +875,7 @@ describe('ProgressiveMigrations', () => {
     migrations.addTenant('tenant-a')
     expect(migrations.pending()).toEqual([])
     expect(mockRunMigrationsBatchSend).toHaveBeenCalledTimes(1)
-    expect(mockGetTenantConfig).toHaveBeenCalledTimes(1)
+    expect(mockGetTenantMigrationState).toHaveBeenCalledTimes(1)
 
     migrations.advanceTime(1)
     migrations.addTenant('tenant-a')
@@ -945,7 +950,7 @@ describe('ProgressiveMigrations', () => {
         await migrations.advanceBothClocksBy(5000)
       }
       expect(mockRunMigrationsBatchSend).toHaveBeenCalledTimes(1)
-      expect(mockGetTenantConfig).toHaveBeenCalledTimes(1)
+      expect(mockGetTenantMigrationState).toHaveBeenCalledTimes(1)
     } finally {
       await controller.abortAsync()
     }
@@ -1026,7 +1031,7 @@ describe('ProgressiveMigrations', () => {
     mockAreMigrationsUpToDate.mockImplementation(async (tenantId) => {
       return tenantId === 'tenant-current'
     })
-    mockGetTenantConfig.mockImplementation(async (tenantId) => {
+    mockGetTenantMigrationState.mockImplementation(async (tenantId) => {
       if (tenantId === 'tenant-b') {
         throw ERRORS.MissingTenantConfig(tenantId)
       }
@@ -1035,7 +1040,7 @@ describe('ProgressiveMigrations', () => {
         throw new Error('tenant lookup failed')
       }
 
-      return defaultTenantConfig
+      return defaultTenantMigrationState
     })
 
     const migrations = createMigrations({ maxSize: 4 })

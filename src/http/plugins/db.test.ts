@@ -28,6 +28,7 @@ async function loadDbPlugins({
     },
   })
   const getTenantConfig = vi.fn()
+  const getTenantMigrationState = vi.fn((tenantId: string) => getTenantConfig(tenantId))
   const areMigrationsUpToDate = vi.fn()
   const lastLocalMigrationName = vi.fn().mockResolvedValue('initialmigration')
   const runMigrationsOnTenant = vi.fn()
@@ -41,6 +42,7 @@ async function loadDbPlugins({
       getPostgresConnection,
       getServiceKeyUser,
       getTenantConfig,
+      getTenantMigrationState,
       PgTenantConnection: class {},
       TenantMigrationStatus: {
         COMPLETED: 'COMPLETED',
@@ -75,6 +77,7 @@ async function loadDbPlugins({
     areMigrationsUpToDate,
     getPostgresConnection,
     getTenantConfig,
+    getTenantMigrationState,
     lastLocalMigrationName,
     progressiveMigrations,
     requestDb,
@@ -176,6 +179,27 @@ describe('migrations plugin', () => {
 
       expect(response.statusCode).toBe(200)
       expect(response.json()).toEqual({ latestMigration: 'search-v2' })
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('does not load tenant config when migrations are already up to date', async () => {
+    const plugins = await loadDbPlugins({
+      dbMigrationStrategy: MultitenantMigrationStrategy.ON_REQUEST,
+      isMultitenant: true,
+    })
+    plugins.getTenantMigrationState.mockResolvedValue({
+      migrationVersion: 'initialmigration',
+      syncMigrationsDone: false,
+    })
+    plugins.areMigrationsUpToDate.mockResolvedValue(true)
+    const { app, injectTenant } = await buildMigrationApp(plugins)
+
+    try {
+      expect((await injectTenant()).statusCode).toBe(200)
+      expect(plugins.getTenantConfig).not.toHaveBeenCalled()
+      expect(plugins.runMigrationsOnTenant).not.toHaveBeenCalled()
     } finally {
       await app.close()
     }

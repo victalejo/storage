@@ -3,6 +3,7 @@ import {
   getPostgresConnection,
   getServiceKeyUser,
   getTenantConfig,
+  getTenantMigrationState,
   type TenantConnection,
   TenantMigrationStatus,
 } from '@internal/database'
@@ -151,7 +152,7 @@ export const migrations = fastifyPlugin(
   async function migrations(fastify) {
     fastify.addHook('preHandler', async (req) => {
       if (isMultitenant) {
-        const { migrationVersion } = await getTenantConfig(req.tenantId)
+        const { migrationVersion } = await getTenantMigrationState(req.tenantId)
         req.latestMigration = migrationVersion
         return
       }
@@ -166,7 +167,7 @@ export const migrations = fastifyPlugin(
           return
         }
 
-        const tenant = await getTenantConfig(request.tenantId)
+        const tenant = await getTenantMigrationState(request.tenantId)
         if (tenant.syncMigrationsDone) {
           request.latestMigration = resolveLatestMigration(
             await lastLocalMigrationName(),
@@ -181,13 +182,13 @@ export const migrations = fastifyPlugin(
 
           if (!migrationsUpToDate) {
             await runMigrationsOnTenant({
-              databaseUrl: tenant.databaseUrl,
+              databaseUrl: (await getTenantConfig(request.tenantId)).databaseUrl,
               tenantId: request.tenantId,
               upToMigration: dbMigrationFreezeAt,
             })
           }
 
-          const refreshedTenant = await getTenantConfig(request.tenantId)
+          const refreshedTenant = await getTenantMigrationState(request.tenantId)
           const resolvedMigration = resolveLatestMigration(
             resolveLatestMigration(localLatest, tenant.migrationVersion),
             refreshedTenant.migrationVersion
@@ -220,7 +221,7 @@ export const migrations = fastifyPlugin(
           return
         }
 
-        const tenant = await getTenantConfig(request.tenantId)
+        const tenant = await getTenantMigrationState(request.tenantId)
         if (tenant.syncMigrationsDone) {
           return
         }

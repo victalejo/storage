@@ -19,6 +19,7 @@ import {
   getFileSizeLimit,
   getServiceKey,
   getTenantConfig,
+  getTenantMigrationState,
   onTenantConfigChange,
 } from '@internal/database/tenant'
 import { logSchema } from '@internal/monitoring'
@@ -1114,6 +1115,7 @@ describe('Tenant configs', () => {
 
     const querySpy = vi.spyOn(multitenantPgExecutor, 'query')
     await getTenantConfig(tenantId)
+    await getTenantMigrationState(tenantId)
     expect(querySpy).toHaveBeenCalledTimes(1)
 
     const results = await Promise.all([
@@ -1152,6 +1154,33 @@ describe('Tenant configs', () => {
       await tenantModule.getTenantConfig(tenantIds[0])
 
       expect(querySpy).toHaveBeenCalledTimes(tenantIds.length + 1)
+    } finally {
+      tenantIds.forEach((tenantId) => {
+        tenantModule.deleteTenantConfig(tenantId)
+      })
+      vi.doUnmock('@internal/cache')
+      vi.resetModules()
+    }
+  })
+
+  test('a migration invalidation does not keep an idle tenant cached', async () => {
+    const tenantIds = ['cache-peek-1', 'cache-peek-2', 'cache-peek-3']
+    const encryptedTenant = createEncryptedTenantRow(tenantIds[0])
+
+    const { tenantModule, multitenantPgModule } = await loadTenantModule(2)
+    const querySpy = vi
+      .spyOn(multitenantPgModule.multitenantPgExecutor, 'query')
+      .mockResolvedValue(mockTenantQueryResult(encryptedTenant))
+
+    try {
+      await tenantModule.getTenantConfig(tenantIds[0])
+      await tenantModule.getTenantConfig(tenantIds[1])
+      tenantModule.deleteTenantMigrationState(tenantIds[0])
+      await tenantModule.getTenantConfig(tenantIds[2])
+      expect(querySpy).toHaveBeenCalledTimes(3)
+
+      await tenantModule.getTenantConfig(tenantIds[1])
+      expect(querySpy).toHaveBeenCalledTimes(3)
     } finally {
       tenantIds.forEach((tenantId) => {
         tenantModule.deleteTenantConfig(tenantId)
@@ -1345,7 +1374,7 @@ describe('Tenant migration version recorded by a newer release', () => {
     const warning = vi.spyOn(logSchema, 'warning').mockImplementation(() => undefined)
     await createTenantWithMigration(stored)
 
-    const config = await getTenantConfig('abc')
+    const config = await getTenantMigrationState('abc')
 
     expect(config.migrationVersion).toBe(expected)
     expect(config.migrationVersionAhead).toBe(ahead)
@@ -1359,10 +1388,10 @@ describe('Tenant migration version recorded by a newer release', () => {
     }
   })
 
-  test('an older release cannot overwrite the stored version and reloads its config', async () => {
+  test('an older release cannot overwrite the stored version and reloads migration state', async () => {
     vi.spyOn(logSchema, 'warning').mockImplementation(() => undefined)
     await createTenantWithMigration('future-migration')
-    await getTenantConfig('abc')
+    await getTenantMigrationState('abc')
 
     await expect(
       migrate.updateTenantMigrationsState('abc', {
@@ -1378,12 +1407,12 @@ describe('Tenant migration version recorded by a newer release', () => {
       migrations_status: TenantMigrationStatus.COMPLETED,
     })
 
-    // The skipped write evicted the cached config, so the next read sees the row as it is now.
+    // The skipped write evicted the cached state, so the next read sees the row as it is now.
     await multitenantPgExecutor.query({
       text: 'UPDATE tenants SET migrations_status = $2 WHERE id = $1',
       values: ['abc', TenantMigrationStatus.FAILED],
     })
-    await expect(getTenantConfig('abc')).resolves.toMatchObject({
+    await expect(getTenantMigrationState('abc')).resolves.toMatchObject({
       migrationVersion,
       migrationVersionAhead: true,
       migrationStatus: TenantMigrationStatus.FAILED,
