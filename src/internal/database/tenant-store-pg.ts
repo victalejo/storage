@@ -43,6 +43,8 @@ export interface TenantConfigRow {
   cursor_id?: number
   created_at?: Date
   updated_at?: Date | null
+  // Exact PostgreSQL timestamp for cache ordering; JS Date truncates microseconds.
+  updated_at_us?: string | null
 }
 
 // Every entry must satisfy quoteIdentifier's strict PostgreSQL identifier pattern.
@@ -104,7 +106,7 @@ export class TenantConfigStorePg {
   async findById(tenantId: string): Promise<TenantConfigRow | undefined> {
     const result = await this.query<TenantConfigRow>({
       text: `
-        SELECT *
+        SELECT *, floor(extract(epoch FROM updated_at) * 1000000)::text AS updated_at_us
         FROM tenants
         WHERE id = $1
         LIMIT 1
@@ -238,12 +240,15 @@ export class TenantConfigStorePg {
 
   async findMigrationsInfo(
     tenantId: string
-  ): Promise<Pick<TenantConfigRow, 'migrations_version' | 'migrations_status'> | undefined> {
+  ): Promise<
+    Pick<TenantConfigRow, 'migrations_version' | 'migrations_status' | 'updated_at_us'> | undefined
+  > {
     const result = await this.query<
-      Pick<TenantConfigRow, 'migrations_version' | 'migrations_status'>
+      Pick<TenantConfigRow, 'migrations_version' | 'migrations_status' | 'updated_at_us'>
     >({
       text: `
-        SELECT migrations_version, migrations_status
+        SELECT migrations_version, migrations_status,
+               floor(extract(epoch FROM updated_at) * 1000000)::text AS updated_at_us
         FROM tenants
         WHERE id = $1
         LIMIT 1

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { readdir, readFile } from 'node:fs/promises'
 import { Client } from 'pg'
-import { getConfig } from '../config'
+import { getConfig, mergeConfig } from '../config'
 
 // The upgrade fixture needs to create a disposable database.
 describe.skipIf(getConfig().databaseEngine === 'multigres')('tenant notification migration', () => {
@@ -209,6 +209,7 @@ describe.skipIf(getConfig().databaseEngine === 'multigres')('tenant notification
   })
 
   it('routes migration-only updates separately after the listener rollout', async () => {
+    await writer.query(await readFile('migrations/multitenant/0033-tenants-updated-at.sql', 'utf8'))
     await writer.query('ALTER TABLE tenants ADD COLUMN IF NOT EXISTS future_config json')
     await writer.query(`
       INSERT INTO public.tenants (id, anon_key, database_url, jwt_secret, service_key)
@@ -239,7 +240,7 @@ describe.skipIf(getConfig().databaseEngine === 'multigres')('tenant notification
       await splitNotificationsFor(
         "UPDATE tenants SET anon_key = 'other', migrations_version = 'storage-schema' WHERE id = 'split-test'"
       )
-    ).toEqual(['tenants_update'])
+    ).toEqual(['tenants_update', 'tenants_migrations_update'])
     expect(
       await splitNotificationsFor(
         "UPDATE tenants SET future_config = '{\"x\":1}'::json WHERE id = 'split-test'"
@@ -273,8 +274,73 @@ describe.skipIf(getConfig().databaseEngine === 'multigres')('tenant notification
         "UPDATE tenants SET migrations_version = 'initialmigration' WHERE id = 'split-test'"
       )
     ).toEqual(['tenants_migrations_update'])
+
+    const repeated = await splitNotificationPayloadsFor(`
+      BEGIN;
+      UPDATE tenants SET migrations_status = 'FAILED' WHERE id = 'split-test';
+      UPDATE tenants SET migrations_status = 'COMPLETED' WHERE id = 'split-test';
+      UPDATE tenants SET migrations_status = 'FAILED' WHERE id = 'split-test';
+      COMMIT;
+    `)
+    expect(repeated).toHaveLength(3)
+    expect(
+      repeated.map((message) => (message.payload as { migrationStatus: string }).migrationStatus)
+    ).toEqual(['FAILED', 'COMPLETED', 'FAILED'])
+    expect(
+      new Set(repeated.map((message) => (message.payload as { eventId: string }).eventId)).size
+    ).toBe(3)
+    const timestamp = await writer.query<{ updated_at_us: string }>(
+      "SELECT floor(extract(epoch FROM updated_at) * 1000000)::text AS updated_at_us FROM tenants WHERE id = 'split-test'"
+    )
+    expect(repeated[2].payload).toMatchObject({ updatedAtUs: timestamp.rows[0].updated_at_us })
+
+    const mixed = await splitNotificationPayloadsFor(`
+      BEGIN;
+      UPDATE tenants SET anon_key = 'config-before' WHERE id = 'split-test';
+      UPDATE tenants SET migrations_status = 'COMPLETED' WHERE id = 'split-test';
+      UPDATE tenants SET anon_key = 'config-after', migrations_status = 'FAILED' WHERE id = 'split-test';
+      COMMIT;
+    `)
+    expect(mixed.map((message) => message.channel)).toEqual([
+      'tenants_update',
+      'tenants_migrations_update',
+      'tenants_migrations_update',
+    ])
+    expect(mixed[2].payload).toMatchObject({
+      type: 'update',
+      tenantId: 'split-test',
+      migrationStatus: 'FAILED',
+    })
+
+    const recreate = await splitNotificationPayloadsFor(`
+      BEGIN;
+      UPDATE tenants SET anon_key = 'before-delete' WHERE id = 'split-test';
+      UPDATE tenants SET migrations_status = 'COMPLETED' WHERE id = 'split-test';
+      DELETE FROM tenants WHERE id = 'split-test';
+      INSERT INTO public.tenants (id, anon_key, database_url, jwt_secret, service_key)
+      VALUES ('split-test', 'new', 'url', 'secret', 'service');
+      COMMIT;
+    `)
+    expect(recreate.map((message) => message.channel)).toEqual([
+      'tenants_update',
+      'tenants_migrations_update',
+      'tenants_migrations_update',
+    ])
+    expect(recreate[2].payload).toMatchObject({ type: 'delete', tenantId: 'split-test' })
+
+    const oversized = await splitNotificationPayloadsFor(
+      "UPDATE tenants SET migrations_version = repeat('x', 9000) WHERE id = 'split-test'"
+    )
+    expect(oversized).toEqual([
+      {
+        channel: 'tenants_migrations_update',
+        payload: expect.objectContaining({ type: 'invalidate', tenantId: 'split-test' }),
+      },
+    ])
+
     expect(await splitNotificationsFor("DELETE FROM tenants WHERE id = 'split-test'")).toEqual([
       'tenants_update',
+      'tenants_migrations_update',
     ])
 
     // Restoring the legacy trigger makes an old listener safe before rollback.
@@ -292,16 +358,106 @@ describe.skipIf(getConfig().databaseEngine === 'multigres')('tenant notification
     ).toEqual(['tenants_update'])
   })
 
+  it('updates cached migration state through PostgreSQL notifications', async () => {
+    const { encrypt } = await import('@internal/auth')
+    const { PostgresPubSub } = await import('@internal/pubsub')
+    const tenant = await import('@internal/database/tenant')
+    const { closeMultitenantPg, multitenantPgExecutor } = await import('@internal/database')
+    const connectionString = url.toString()
+    const pubsub = new PostgresPubSub(connectionString)
+    pubsub.on('error', () => {})
+    mergeConfig({
+      multitenantDatabaseUrl: connectionString,
+      multitenantDatabasePoolUrl: connectionString,
+    })
+    await writer.query(await readFile('migrations/multitenant/0033-tenants-updated-at.sql', 'utf8'))
+    await writer.query(
+      await readFile('migrations/rollout/tenant-migration-notifications.sql', 'utf8')
+    )
+    await writer.query(
+      `INSERT INTO public.tenants (id, anon_key, database_url, jwt_secret, service_key, migrations_version, migrations_status)
+       VALUES ($1, $2, $3, $4, $5, 'initialmigration', 'FAILED')`,
+      ['live-test', encrypt('anon'), encrypt('url'), encrypt('secret'), encrypt('service')]
+    )
+
+    try {
+      await pubsub.start()
+      await tenant.listenForTenantUpdate(pubsub)
+      const config = await tenant.getTenantConfig('live-test')
+      const previous = await tenant.getTenantMigrationState('live-test')
+      previous.syncMigrationsDone = true
+      const query = vi.spyOn(multitenantPgExecutor, 'query')
+
+      let barrier = Promise.withResolvers<void>()
+      await pubsub.subscribe('tenant_test_barrier', () => barrier.resolve())
+      await writer.query(
+        "UPDATE tenants SET migrations_version = 'storage-schema', migrations_status = 'COMPLETED' WHERE id = 'live-test'"
+      )
+      await writer.query("SELECT pg_notify('tenant_test_barrier', $1)", [JSON.stringify('done')])
+      await barrier.promise
+
+      expect(await tenant.getTenantConfig('live-test')).toBe(config)
+      const state = await tenant.getTenantMigrationState('live-test')
+      expect(state).toMatchObject({
+        migrationVersion: 'storage-schema',
+        migrationStatus: 'COMPLETED',
+      })
+      expect(state).not.toBe(previous)
+      expect(state.syncMigrationsDone).toBeUndefined()
+      expect(query).not.toHaveBeenCalled()
+
+      barrier = Promise.withResolvers<void>()
+      await writer.query("SELECT pg_notify('tenants_migrations_update', $1)", [
+        JSON.stringify({
+          type: 'update',
+          tenantId: 'live-test',
+          eventId: 'delayed-event',
+          migrationVersion: 'initialmigration',
+          migrationStatus: 'FAILED',
+          updatedAtUs: previous.updatedAtUs,
+        }),
+      ])
+      await writer.query("SELECT pg_notify('tenant_test_barrier', $1)", [JSON.stringify('done')])
+      await barrier.promise
+      expect(await tenant.getTenantMigrationState('live-test')).toMatchObject({
+        migrationVersion: 'storage-schema',
+        migrationStatus: 'COMPLETED',
+      })
+      expect(query).toHaveBeenCalledTimes(1)
+    } finally {
+      tenant.deleteTenantConfig('live-test')
+      await pubsub.close()
+      await closeMultitenantPg()
+    }
+  })
+
   async function splitNotificationsFor(sql: string): Promise<string[]> {
+    return (await splitNotificationPayloadsFor(sql)).map((message) => message.channel)
+  }
+
+  async function splitNotificationPayloadsFor(
+    sql: string
+  ): Promise<{ channel: string; payload: unknown }[]> {
     const marker = JSON.stringify(`marker-${randomUUID()}`)
-    const messages: string[] = []
+    const messages: { channel: string; payload: unknown }[] = []
     let resolveMarker!: () => void
     const markerSeen = new Promise<void>((resolve) => {
       resolveMarker = resolve
     })
     const onNotification = (message: { channel: string; payload?: string }) => {
       if (message.payload === marker) resolveMarker()
-      else if (message.payload === '"split-test"') messages.push(message.channel)
+      else if (message.payload) {
+        const payload: unknown = JSON.parse(message.payload)
+        if (
+          payload === 'split-test' ||
+          (payload &&
+            typeof payload === 'object' &&
+            'tenantId' in payload &&
+            payload.tenantId === 'split-test')
+        ) {
+          messages.push({ channel: message.channel, payload })
+        }
+      }
     }
     listener.on('notification', onNotification)
     try {
